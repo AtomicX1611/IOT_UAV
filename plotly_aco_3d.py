@@ -1,12 +1,15 @@
 import random
 import math
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import numpy as np
 import plotly.graph_objects as go
 from plotly.colors import sample_colorscale
 
 from aco_tsp import ACO_TSP
+from aco_multi_entry_igpu import ACO_MultiEntry_IGPU
+from aco_multi_entry_baseline import ACO_MultiEntry_Baseline
 
 
 Point3D = Tuple[float, float, float]
@@ -25,6 +28,9 @@ class SimulationConfig:
     ant_interp_steps: int = 4
     top_pheromone_edges: int = 45
     save_html_path: Optional[str] = "aco_3d_simulation.html"
+    algo: str = "tsp"  # one of "tsp", "multi_entry_baseline", "multi_entry_igpu"
+    show_fisher_landscape: bool = False
+    regions: Optional[List[Dict[str, Any]]] = None
 
 
 def _normalize_axis(values: Sequence[float], target_span: float = 100.0) -> List[float]:
@@ -134,6 +140,137 @@ def run_aco_with_history(
     }
 
 
+def run_igpu_with_history(
+    regions: List[Dict[str, Any]],
+    num_entry: int = 8,
+    n_ants: int = 30,
+    n_iter: int = 150,
+    alpha: float = 1.0,
+    beta: float = 2.5,
+    gamma: float = 0.05,
+    lambda_damping: float = 1e-4,
+    seed: Optional[int] = None,
+) -> Dict[str, object]:
+    """Run ACO_MultiEntry_IGPU and return a result dict compatible with run_aco_with_history.
+
+    The 'iteration_history' entries additionally contain 'fisher_diag'
+    (the full F_diag matrix for each iteration) for Fisher-landscape
+    visualization.
+    """
+    aco = ACO_MultiEntry_IGPU(
+        regions=regions,
+        num_entry=num_entry,
+        n_ants=n_ants,
+        n_iter=n_iter,
+        alpha=alpha,
+        beta=beta,
+        gamma=gamma,
+        lambda_damping=lambda_damping,
+        seed=seed,
+    )
+
+    best_path, best_cost, raw_history = aco.run()
+
+    # Build 2D points for 3D lifting
+    points_2d = aco.nodes
+    points_3d = generate_3d_points(
+        points_2d=points_2d,
+        z_mode="random",
+        normalize=True,
+        seed=seed,
+    )
+
+    cost_history: List[float] = []
+    iteration_history: List[Dict[str, object]] = []
+
+    # Rebuild per-iteration pheromone snapshots by replaying the run.
+    # The IGPU class stores tau in-place; raw_history has P_old/P_new but
+    # not raw tau snapshots.  However we can derive a compatible pheromone
+    # matrix from tau (numpy) by converting to nested lists.
+    # We re-run to capture snapshots — but that is expensive.
+    # Instead, reconstruct from the IGPU engine's stored diagnostics
+    # and the final tau, approximating intermediate tau via P_new.
+
+    # Re-run to capture per-iteration tau snapshots and fisher diags.
+    aco2 = ACO_MultiEntry_IGPU(
+        regions=regions,
+        num_entry=num_entry,
+        n_ants=n_ants,
+        n_iter=n_iter,
+        alpha=alpha,
+        beta=beta,
+        gamma=gamma,
+        lambda_damping=lambda_damping,
+        seed=seed,
+    )
+
+    overall_best_path: Optional[List[int]] = None
+    overall_best_cost = float("inf")
+
+    from igpu_update import IGPUEngine
+    from utils_math import softmax_policy, fisher_diagonal
+
+    for it in range(aco2.n_iter):
+        tours: List[List[int]] = []
+        costs_iter: List[float] = []
+
+        for _ in range(aco2.n_ants):
+            path = aco2.construct_path()
+            cost = aco2.path_cost(path)
+            tours.append(path)
+            costs_iter.append(cost)
+            if cost < overall_best_cost:
+                overall_best_cost = cost
+                overall_best_path = path[:]
+
+        # Snapshot tau BEFORE update for pheromone vis
+        tau_snapshot = aco2.tau.copy()
+
+        # Compute Fisher diagonal BEFORE update (current policy)
+        P_current = softmax_policy(
+            aco2.tau, aco2.eta, aco2.alpha, aco2.beta
+        )
+        F_diag = fisher_diagonal(
+            P_current, aco2.tau, aco2.alpha, aco2.igpu.lambda_damping
+        )
+
+        # Now do the IGPU step
+        aco2.tau, diag = aco2.igpu.step(
+            aco2.tau, aco2.eta, tours, costs_iter
+        )
+
+        cost_history.append(overall_best_cost)
+
+        top_ants = sorted(
+            zip(tours, costs_iter), key=lambda item: item[1]
+        )
+        iteration_history.append(
+            {
+                "iteration": it + 1,
+                "best_path": overall_best_path[:] if overall_best_path else [],
+                "best_cost": overall_best_cost,
+                "ant_paths": [p[:] for p, _ in top_ants],
+                "ant_costs": [c for _, c in top_ants],
+                "pheromone": tau_snapshot.tolist(),
+                "fisher_diag": F_diag.tolist(),
+            }
+        )
+
+        iter_best = top_ants[0][1]
+        print(
+            f"Iteration {it + 1}: "
+            f"Iter Best = {iter_best:.2f}, Global Best = {overall_best_cost:.2f}"
+        )
+
+    return {
+        "best_path": overall_best_path if overall_best_path is not None else [],
+        "best_cost": overall_best_cost,
+        "cost_history": cost_history,
+        "iteration_history": iteration_history,
+        "points_3d": points_3d,
+    }
+
+
 def _path_xyz(points_3d: Sequence[Point3D], path: Sequence[int], close_loop: bool = True):
     if not path:
         return [], [], []
@@ -224,6 +361,81 @@ def _build_pheromone_edge_traces(
     return traces
 
 
+def _extract_top_fisher_edges(
+    fisher_matrix: Sequence[Sequence[float]],
+    top_k: int,
+) -> List[Tuple[int, int, float]]:
+    """Extract top-K edges ranked by *inverse* Fisher diagonal.
+
+    Lower Fisher ⇒ higher uncertainty ⇒ less confident.
+    Higher Fisher ⇒ more confident ⇒ "glows brighter".
+    We rank by the Fisher value itself (descending) so confident edges
+    appear first.
+    """
+    weighted_edges: List[Tuple[int, int, float]] = []
+    n = len(fisher_matrix)
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            w = float(fisher_matrix[i][j])
+            weighted_edges.append((i, j, w))
+
+    weighted_edges.sort(key=lambda item: item[2], reverse=True)
+    if not weighted_edges:
+        return []
+
+    return weighted_edges[:top_k]
+
+
+def _build_fisher_edge_traces(
+    points_3d: Sequence[Point3D],
+    fisher_matrix: Sequence[Sequence[float]],
+    top_k: int,
+) -> List[go.Scatter3d]:
+    """Build Scatter3d traces for Fisher information edges.
+
+    Confident edges (high Fisher value) glow brighter with higher opacity
+    and wider lines. Uses the "Viridis" colorscale.
+    """
+    edges = _extract_top_fisher_edges(fisher_matrix, top_k=top_k)
+    if not edges:
+        return [_empty_line_trace("Fisher") for _ in range(top_k)]
+
+    min_w = min(w for _, _, w in edges)
+    max_w = max(w for _, _, w in edges)
+    denom = max(max_w - min_w, 1e-12)
+
+    traces: List[go.Scatter3d] = []
+    for idx in range(top_k):
+        if idx >= len(edges):
+            traces.append(_empty_line_trace("Fisher"))
+            continue
+
+        i, j, w = edges[idx]
+        intensity = (w - min_w) / denom
+        color = sample_colorscale("Viridis", [intensity])[0]
+
+        x0, y0, z0 = points_3d[i]
+        x1, y1, z1 = points_3d[j]
+        traces.append(
+            go.Scatter3d(
+                x=[x0, x1],
+                y=[y0, y1],
+                z=[z0, z1],
+                mode="lines",
+                line={"width": 1.0 + 5.0 * intensity, "color": color},
+                opacity=0.3 + 0.6 * intensity,
+                name="Fisher" if idx == 0 else "",
+                showlegend=idx == 0,
+                hovertemplate=(
+                    f"Edge: {i}-{j}<br>Fisher: {w:.4e}<extra></extra>"
+                ),
+            )
+        )
+
+    return traces
+
+
 def _ant_positions_for_progress(
     points_3d: Sequence[Point3D],
     ant_paths: Sequence[Sequence[int]],
@@ -264,6 +476,7 @@ def create_frames(
     max_ants_visualized: int = 8,
     ant_interp_steps: int = 4,
     top_pheromone_edges: int = 45,
+    show_fisher_landscape: bool = False,
 ) -> List[go.Frame]:
     """Build high-detail animation frames with smooth ant interpolation per iteration."""
     frames: List[go.Frame] = []
@@ -331,6 +544,14 @@ def create_frames(
             ]
             frame_traces.extend(pheromone_traces)
 
+            if show_fisher_landscape and "fisher_diag" in state:
+                fisher_traces = _build_fisher_edge_traces(
+                    points_3d,
+                    state["fisher_diag"],
+                    top_k=top_pheromone_edges,
+                )
+                frame_traces.extend(fisher_traces)
+
             frames.append(
                 go.Frame(
                     data=frame_traces,
@@ -361,6 +582,7 @@ def plot_simulation(
     ant_interp_steps: int = 4,
     top_pheromone_edges: int = 45,
     save_html_path: Optional[str] = "aco_3d_simulation.html",
+    show_fisher_landscape: bool = False,
 ):
     """Render and optionally persist the interactive Plotly ACO 3D simulation."""
     iteration_history = simulation_result["iteration_history"]
@@ -378,6 +600,7 @@ def plot_simulation(
         max_ants_visualized=max_ants_visualized,
         ant_interp_steps=ant_interp_steps,
         top_pheromone_edges=top_pheromone_edges,
+        show_fisher_landscape=show_fisher_landscape,
     )
 
     initial_frame = frames[0]
@@ -517,38 +740,170 @@ def plot_simulation(
     return fig
 
 
+def _default_demo_regions() -> List[Dict[str, Any]]:
+    """Generate a default set of regions for multi-entry demos."""
+    return [
+        {"center": (100.0, 100.0), "radius": 40.0},
+        {"center": (400.0, 150.0), "radius": 35.0},
+        {"center": (250.0, 400.0), "radius": 50.0},
+        {"center": (600.0, 350.0), "radius": 30.0},
+        {"center": (750.0, 100.0), "radius": 45.0},
+        {"center": (500.0, 600.0), "radius": 38.0},
+    ]
+
+
 def run_demo(config: Optional[SimulationConfig] = None):
     cfg = config or SimulationConfig()
 
-    rng = random.Random(cfg.random_seed)
-    points_2d = [
-        (rng.uniform(0.0, 1000.0), rng.uniform(0.0, 1000.0))
-        for _ in range(cfg.n_cities)
-    ]
-    points_3d = generate_3d_points(
-        points_2d=points_2d,
-        z_mode="random",
-        normalize=True,
-        seed=cfg.random_seed,
-    )
+    if cfg.algo == "multi_entry_igpu":
+        # ── IGPU multi-entry branch ─────────────────────────────────
+        regions = cfg.regions if cfg.regions is not None else _default_demo_regions()
 
-    result = run_aco_with_history(
-        points_3d,
-        n_ants=cfg.n_ants,
-        n_iter=cfg.n_iter,
-        alpha=cfg.alpha,
-        beta=cfg.beta,
-        evaporation=cfg.evaporation,
-    )
+        result = run_igpu_with_history(
+            regions=regions,
+            num_entry=8,
+            n_ants=cfg.n_ants,
+            n_iter=cfg.n_iter,
+            alpha=cfg.alpha,
+            beta=cfg.beta,
+            seed=cfg.random_seed,
+        )
 
-    print("\nFinal Best Path:", result["best_path"])
-    print("Final Best Cost:", f"{result['best_cost']:.2f}")
+        points_3d = result.pop("points_3d")
 
-    return plot_simulation(
-        points_3d,
-        result,
-        max_ants_visualized=cfg.max_ants_visualized,
-        ant_interp_steps=cfg.ant_interp_steps,
-        top_pheromone_edges=cfg.top_pheromone_edges,
-        save_html_path=cfg.save_html_path,
-    )
+        print("\nFinal Best Path:", result["best_path"])
+        print("Final Best Cost:", f"{result['best_cost']:.2f}")
+
+        return plot_simulation(
+            points_3d,
+            result,
+            max_ants_visualized=cfg.max_ants_visualized,
+            ant_interp_steps=cfg.ant_interp_steps,
+            top_pheromone_edges=cfg.top_pheromone_edges,
+            save_html_path=cfg.save_html_path,
+            show_fisher_landscape=cfg.show_fisher_landscape,
+        )
+
+    elif cfg.algo == "multi_entry_baseline":
+        # ── Baseline multi-entry branch ─────────────────────────────
+        regions = cfg.regions if cfg.regions is not None else _default_demo_regions()
+
+        aco = ACO_MultiEntry_Baseline(
+            regions=regions,
+            num_entry=8,
+            n_ants=cfg.n_ants,
+            n_iter=cfg.n_iter,
+            alpha=cfg.alpha,
+            beta=cfg.beta,
+            evaporation=cfg.evaporation,
+            seed=cfg.random_seed,
+        )
+        best_path, best_cost, raw_history = aco.run()
+
+        points_3d = generate_3d_points(
+            points_2d=aco.nodes,
+            z_mode="random",
+            normalize=True,
+            seed=cfg.random_seed,
+        )
+
+        # Build compatible iteration_history
+        iteration_history: List[Dict[str, object]] = []
+        overall_best_cost = float("inf")
+        overall_best_path: Optional[List[int]] = None
+
+        # Re-run to capture per-iteration snapshots
+        aco2 = ACO_MultiEntry_Baseline(
+            regions=regions,
+            num_entry=8,
+            n_ants=cfg.n_ants,
+            n_iter=cfg.n_iter,
+            alpha=cfg.alpha,
+            beta=cfg.beta,
+            evaporation=cfg.evaporation,
+            seed=cfg.random_seed,
+        )
+        cost_history: List[float] = []
+        for it in range(aco2.n_iter):
+            tours: List[List[int]] = []
+            costs_iter: List[float] = []
+            for _ in range(aco2.n_ants):
+                path = aco2.construct_path()
+                cost = aco2.path_cost(path)
+                tours.append(path)
+                costs_iter.append(cost)
+                if cost < overall_best_cost:
+                    overall_best_cost = cost
+                    overall_best_path = path[:]
+
+            tau_snapshot = aco2.tau.copy()
+            aco2._update_pheromones(tours, costs_iter)
+
+            cost_history.append(overall_best_cost)
+            top_ants = sorted(
+                zip(tours, costs_iter), key=lambda item: item[1]
+            )
+            iteration_history.append(
+                {
+                    "iteration": it + 1,
+                    "best_path": overall_best_path[:] if overall_best_path else [],
+                    "best_cost": overall_best_cost,
+                    "ant_paths": [p[:] for p, _ in top_ants],
+                    "ant_costs": [c for _, c in top_ants],
+                    "pheromone": tau_snapshot.tolist(),
+                }
+            )
+
+        result = {
+            "best_path": overall_best_path if overall_best_path else [],
+            "best_cost": overall_best_cost,
+            "cost_history": cost_history,
+            "iteration_history": iteration_history,
+        }
+
+        print("\nFinal Best Path:", result["best_path"])
+        print("Final Best Cost:", f"{result['best_cost']:.2f}")
+
+        return plot_simulation(
+            points_3d,
+            result,
+            max_ants_visualized=cfg.max_ants_visualized,
+            ant_interp_steps=cfg.ant_interp_steps,
+            top_pheromone_edges=cfg.top_pheromone_edges,
+            save_html_path=cfg.save_html_path,
+        )
+
+    else:
+        # ── Default TSP branch (unchanged behavior) ─────────────────
+        rng = random.Random(cfg.random_seed)
+        points_2d = [
+            (rng.uniform(0.0, 1000.0), rng.uniform(0.0, 1000.0))
+            for _ in range(cfg.n_cities)
+        ]
+        points_3d = generate_3d_points(
+            points_2d=points_2d,
+            z_mode="random",
+            normalize=True,
+            seed=cfg.random_seed,
+        )
+
+        result = run_aco_with_history(
+            points_3d,
+            n_ants=cfg.n_ants,
+            n_iter=cfg.n_iter,
+            alpha=cfg.alpha,
+            beta=cfg.beta,
+            evaporation=cfg.evaporation,
+        )
+
+        print("\nFinal Best Path:", result["best_path"])
+        print("Final Best Cost:", f"{result['best_cost']:.2f}")
+
+        return plot_simulation(
+            points_3d,
+            result,
+            max_ants_visualized=cfg.max_ants_visualized,
+            ant_interp_steps=cfg.ant_interp_steps,
+            top_pheromone_edges=cfg.top_pheromone_edges,
+            save_html_path=cfg.save_html_path,
+        )
