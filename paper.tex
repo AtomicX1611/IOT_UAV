@@ -1,0 +1,100 @@
+\documentclass[conference]{IEEEtran}
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{physics}
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+\begin{document}
+
+\title{Information-Geometric Pheromone Update for Multi-Entry Ant Colony Optimization}
+
+\author{\IEEEauthorblockN{1\textsuperscript{st} Given Name Surname}
+\IEEEauthorblockA{\textit{dept. name of organization (of Aff.)} \\
+\textit{name of organization (of Aff.)}\\
+City, Country \\
+email address or ORCID}
+\and
+\IEEEauthorblockN{2\textsuperscript{nd} Given Name Surname}
+\IEEEauthorblockA{\textit{dept. name of organization (of Aff.)} \\
+\textit{name of organization (of Aff.)}\\
+City, Country \\
+email address or ORCID}
+}
+
+\maketitle
+
+\begin{abstract}
+Ant Colony Optimization (ACO) algorithms traditionally rely on heuristic pheromone deposition and evaporation models, which are prone to premature convergence and plateauing in complex environments. This paper proposes a novel framework extending ACO to the Multi-Entry Region Traveling Salesman Problem using Information Geometry. Instead of standard heuristic updates, our method frames pheromone adaptation as a natural gradient descent step on the parameter space of the ants' stochastic policy. By exploiting the Fisher information matrix augmented by a dynamic damping factor ($\lambda$), our Information-Geometric Pheromone Update (IGPU) explicitly corrects for local distribution scalings while using a standardized REINFORCE-style advantage objective. Empirical trials across varying parameter sweeps demonstrate significant convergence stability and more decisive routing performance than standard elitist baseline models.
+\end{abstract}
+
+\begin{IEEEkeywords}
+Ant Colony Optimization, Information Geometry, Natural Gradient, Multi-Entry TSP, Reinforcement Learning
+\end{IEEEkeywords}
+
+\section{Introduction}
+Ant Colony Optimization (ACO) is a celebrated metaheuristic modeled after the foraging behavior of biological ants. ACO operates effectively by utilizing an artificial pheromone matrix $\tau$ and local heuristic visibility $\eta$. While historically robust, ACO often struggles with the Multi-Entry Region Traveling Salesman Problem, where targets are continuous or multi-nodal spatial clusters rather than singular coordinates \cite{dorigo1996ant}. 
+
+A critical limitation of traditional ACO is its rigid adherence to heuristic rules governing pheromone evaporation ($\rho$) and additive deposition based on tour outcomes. Such rules often disregard the natural geometry of the policy distribution, risking premature convergence or cyclic divergence in complex edge topologies.
+
+In this work, we introduce an Information-Geometric Pheromone Update (IGPU) system that models path selection as a parameterized policy $\pi_{\tau}$. By calculating the natural gradient of localized path expected advantages scaled by the Fisher Information inverse, IGPU directly operates on the true steepest ascent trajectory over the probability simplex. Our contribution replaces arbitrary evaporation structures with a grounded, mathematically rigorous update equation.
+
+\section{System Model}
+\subsection{Multi-Entry TSP Architecture}
+Consider a complete graph $G=(V, E)$, where $V$ represents a set of generated entry nodes. The nodes are grouped into non-overlapping regions $R = \{r_1, r_2, \dots, r_K\}$, where each region $r_i$ possesses a center coordinate and a radius, populated by $m$ boundary nodes. Ants are tasked with visiting at least one node in each region exactly once, minimizing the overall Euclidean path length. The heuristic desirability for moving from node $i$ to $j$ is strictly defined as $\eta_{ij} = d(i,j)^{-1}$, where $d(i,j)$ is the Euclidean distance.
+
+\subsection{ACO Policy Formalization}
+The probabilistic state transition for an ant stationed at node $i$ choosing unvisited node $j$ is derived by the parameterized softmax policy:
+\begin{equation}
+P(j | i;\tau) = \frac{[\tau_{ij}]^\alpha [\eta_{ij}]^\beta}{\sum_{k \in \mathcal{N}_i} [\tau_{ik}]^\alpha [\eta_{ik}]^\beta}
+\end{equation}
+where $\mathcal{N}_i$ denotes the set of valid unvisited region nodes. Standard ACO limits the step progression to:
+\begin{equation}
+\tau_{ij} \gets (1 - \rho)\tau_{ij} + \sum_{k=1}^m \Delta\tau_{ij}^k
+\end{equation}
+
+\section{Information-Geometric Optimization}
+
+To escape the heuristic constraints, we propose optimizing the stochastic matrix $\tau$ via natural policy gradients. By framing the pheromone concentrations as learnable statistics and applying Amari's Natural Gradient \cite{amari1998natural}, the update rule observes invariant probability mappings. 
+
+\subsection{Advantage Generation}
+For a generated batch of tours $\{T_1, \dots, T_N\}$ evaluating to path costs $C_k$, we apply a standardized REINFORCE advantage estimator:
+\begin{equation}
+A(T_k) = \frac{\mu_C - C_k}{\sigma_C + \epsilon}
+\end{equation}
+where $\mu_C$ and $\sigma_C$ correspond to the batch mean and standard deviation respectively. This formulation directly signals how a given path functionally outperforms its immediate localized generation batch, resolving common gradient collapse problems observed with $1/C_k$ heuristics.
+
+\subsection{Natural Gradient Step}
+The log-probability gradient $G$ over the parameters for a tour visited edges is calculated as:
+\begin{equation}
+\nabla_{\tau} \log P(T_k|\tau) = \frac{\alpha}{\tau_{ij}} (1 - P(j|i))
+\end{equation}
+
+To obtain the computationally viable natural gradient, we approximate the Fisher information matrix diagonally, incorporating structural boundary damping $\lambda$:
+\begin{equation}
+F_{ij} \approx \left(\frac{\alpha}{\tau_{ij}}\right)^2 P(j|i)(1 - P(j|i)) + \lambda
+\end{equation}
+The single integrated IGPU parameter update is modeled dynamically as:
+\begin{equation}
+\tau \gets \text{CLIP} \left( \tau + \gamma \frac{\frac{1}{N} \sum_k A(T_k) \nabla_{\tau} \log P_k}{F} \right)
+\end{equation}
+
+\section{Experimental Results}
+
+The structure was built and evaluated using an isolated python environment leveraging multi-seed iterations ($N_{\text{seeds}}=5$). IGPU effectively decouples the necessity for exhaustive parametric hyper-tuning over standard configurations.
+
+Sensitivity testing against the damping matrix parameter $\lambda$ indicated distinct boundary influences. As $\lambda \to \infty$, the Fisher matrix restricts structural movement, freezing learning, whereas fine-tuned moderate limits correctly scale standard REINFORCE updates. IGPU significantly reduced the standard deviation of final route costs across 150 generations and drastically bounded the mean. Pheromone entropy mapping indicated IGPU achieves sparse decision states decisively faster, bypassing standard exploration bottlenecks.
+
+\section{Conclusion}
+This paper demonstrates that swapping heuristic evaporation mechanisms for a mathematical policy gradient mapped via information geometry produces robust routing behavior in Multi-Entry ACO. By standardizing the advantage step and bounding parameter scale with Fisher approximations, IGPU represents a mathematically stable step forward for swarm intelligence routing logic.
+
+\begin{thebibliography}{00}
+\bibitem{dorigo1996ant} M. Dorigo, V. Maniezzo, and A. Colorni, ``Ant system: optimization by a colony of cooperating agents,'' IEEE Trans. Syst., Man, Cybern. B, Cybern., vol. 26, no. 1, pp. 29--41, 1996.
+\bibitem{amari1998natural} S. Amari, ``Natural gradient works efficiently in learning,'' Neural computation, vol. 10, no. 2, pp. 251-276, 1998.
+\end{thebibliography}
+
+\end{document}

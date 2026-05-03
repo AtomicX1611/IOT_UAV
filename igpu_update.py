@@ -46,9 +46,10 @@ class IGPUEngine:
         self.history = []
 
     def compute_advantage(self, costs: List[float]) -> np.ndarray:
-        """REINFORCE-style advantage A_k = f_k - mean(f), with f_k = 1/(cost_k + 1e-9)."""
-        f = 1.0 / (np.asarray(costs, dtype=float) + 1e-9)
-        return f - f.mean()
+        """REINFORCE-style advantage A_k = (mean(cost) - cost_k) / (std(cost) + 1e-9)."""
+        c = np.asarray(costs, dtype=float)
+        std_c = c.std() + 1e-9
+        return (c.mean() - c) / std_c
 
     def step(
         self,

@@ -393,32 +393,59 @@ def plot_e6(output_dir: str, data: Dict[str, Any]) -> None:
 
 
 def experiment_e7(output_dir: str) -> None:
+    """Lambda-damping sensitivity study.
+
+    Uses a smaller problem (num_entry=16 → 128 nodes) and higher gamma so
+    that the natural-gradient signal is large enough for lambda to matter.
+    Results are averaged over 5 seeds for statistical robustness.
+    """
     n_regions = 8
-    num_entry = 64
-    seed = 0
-    regions = build_random_regions(n_regions, num_entry, seed=seed)
+    num_entry = 16
+    seeds = [0, 1, 2, 3, 4]
+    gamma_e7 = 0.15  # amplified for sensitivity study
 
-    lambdas: List[float] = [1e-6, 1e-4, 1e-2, 1.0, 100.0]
-    igpu_costs: List[float] = []
+    regions_per_seed = {s: build_random_regions(n_regions, num_entry, seed=s) for s in seeds}
+
+    lambdas: List[float] = [1e-6, 1e-4, 1e-2, 0.1, 1.0, 10.0, 100.0]
+    igpu_means: List[float] = []
+    igpu_stds: List[float] = []
+
     for lam in lambdas:
-        t0 = time.time()
-        res = run_single(
-            ACO_MultiEntry_IGPU, regions, num_entry, seed=seed,
-            lambda_damping=lam,
-        )
-        igpu_costs.append(float(res["best_cost"]))
-        print(f"E7 lambda={lam:8.0e}  cost={res['best_cost']:8.2f} ({time.time() - t0:5.1f}s)")
+        costs_lam: List[float] = []
+        for s in seeds:
+            t0 = time.time()
+            res = run_single(
+                ACO_MultiEntry_IGPU, regions_per_seed[s], num_entry,
+                n_ants=30, n_iter=150, seed=s,
+                lambda_damping=lam, gamma=gamma_e7,
+            )
+            costs_lam.append(float(res["best_cost"]))
+            print(
+                f"E7 lambda={lam:8.0e} seed={s} "
+                f"cost={res['best_cost']:8.2f} ({time.time() - t0:5.1f}s)"
+            )
+        igpu_means.append(float(np.mean(costs_lam)))
+        igpu_stds.append(float(np.std(costs_lam)))
 
-    res_b = run_single(ACO_MultiEntry_Baseline, regions, num_entry, seed=seed)
-    baseline_cost = float(res_b["best_cost"])
+    # Baseline reference averaged over same seeds
+    baseline_costs: List[float] = []
+    for s in seeds:
+        res_b = run_single(
+            ACO_MultiEntry_Baseline, regions_per_seed[s], num_entry, seed=s,
+        )
+        baseline_costs.append(float(res_b["best_cost"]))
+    baseline_mean = float(np.mean(baseline_costs))
 
     fig, ax = plt.subplots(figsize=FIGSIZE)
-    ax.plot(lambdas, igpu_costs, marker="o", color=COLOR_IGPU, label="IGPU")
-    ax.axhline(baseline_cost, color=COLOR_BASE, linestyle="--", label="baseline ref")
+    m = np.asarray(igpu_means)
+    st = np.asarray(igpu_stds)
+    ax.plot(lambdas, m, marker="o", color=COLOR_IGPU, label="IGPU")
+    ax.fill_between(lambdas, m - st, m + st, alpha=0.2, color=COLOR_IGPU)
+    ax.axhline(baseline_mean, color=COLOR_BASE, linestyle="--", label="baseline ref")
     ax.set_xscale("log")
     ax.set_xlabel(r"Fisher damping $\lambda$")
     ax.set_ylabel("Final tour cost")
-    ax.set_title("E7: λ sweep (IGPU only) vs baseline")
+    ax.set_title(r"E7: $\lambda$ sweep (mean ± std, 5 seeds)")
     ax.legend()
     fig.tight_layout()
     fig.savefig(os.path.join(output_dir, "e7_lambda.png"), dpi=120)
@@ -426,8 +453,9 @@ def experiment_e7(output_dir: str) -> None:
 
     _save_pickle(_pkl_path(output_dir, "e7_lambda.pkl"), {
         "lambdas": lambdas,
-        "igpu_costs": igpu_costs,
-        "baseline_cost": baseline_cost,
+        "igpu_means": igpu_means,
+        "igpu_stds": igpu_stds,
+        "baseline_mean": baseline_mean,
     })
 
 
